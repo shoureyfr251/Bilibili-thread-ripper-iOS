@@ -242,3 +242,97 @@ test("the custom CDN mode uses only the servers picked in the settings, and only
   hosts=["upos-sz-mirrorbos.bilivideo.com"];
   assert.deepEqual(hostsOf(resolver.urls()),["upos-sz-mirrorbos.bilivideo.com"]);
 });
+
+test("queued pieces move off a cooled node without extra failures and deliver ordered bytes",{timeout:5000},async()=>{
+  const {cdn,idm}=load();
+  const bad="upos-sz-mirrorali.bilivideo.com",good="upos-sz-mirrorhw.bilivideo.com";
+  const resolver=cdn.createResolver({baseUrl:mediaUrl(bad)},()=>"custom",null,()=>[bad,good]);
+  let badCalls=0,cooledCalls=0;
+  const failures=[];
+  const pattern=(start,length)=>Uint8Array.from({length},(_value,index)=>(start+index)%251);
+  const nativeFetch=async(url,init)=>{
+    const host=new URL(url).hostname;
+    const [,start,end]=/bytes=(\d+)-(\d+)/.exec(init.headers.Range).map(Number);
+    const headers={"Content-Range":`bytes ${start}-${end}/524288`};
+    if(host===bad){
+      badCalls+=1;
+      if(Array.from(resolver.status()).find(item=>item.host===bad).state==="blocked")cooledCalls+=1;
+      let sent=false;
+      return new Response(new ReadableStream({pull(controller){
+        if(sent)controller.error(new Error("partial connection failure"));
+        else{sent=true;controller.enqueue(pattern(start,1024));}
+      }}),{status:206,headers});
+    }
+    await new Promise(resolve=>setTimeout(resolve,15));
+    return new Response(pattern(start,end-start+1),{status:206,headers});
+  };
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch,
+    onTransfer:event=>{if(event.phase==="error")failures.push(event);}});
+  const ranges=[{start:0,end:262143,length:262144},{start:262144,end:524287,length:262144}];
+  const results=await Promise.all(ranges.map(async range=>{
+    let next=range.start;
+    const chunks=[];
+    const result=await downloader.downloadRange(range,resolver,{onOrderedChunk(bytes,piece,total){
+      assert.equal(piece.start,next);assert.equal(bytes.length,piece.length);assert.equal(total,524288);
+      assert.ok(bytes.every((value,index)=>value===(piece.start+index)%251));
+      next+=bytes.length;chunks.push(bytes);
+    }});
+    assert.equal(next,range.end+1);assert.equal(result.streamed,true);
+    assert.equal(chunks.reduce((total,bytes)=>total+bytes.length,0),range.length);
+    return result;
+  }));
+  assert.equal(results.length,2);assert.ok(badCalls>0,"the initial node actually fails");
+  assert.equal(cooledCalls,0,"requests waiting for a slot must recheck current health");
+  assert.equal(failures.length,badCalls,"redirecting a queued request adds no failure strike");
+});
+
+test("request-time selection avoids an active copy and keeps an all-cooled fallback with 206 validation",{timeout:5000},async()=>{
+  const {cdn,idm}=load();
+  const hosts=["upos-sz-mirrorali.bilivideo.com","upos-sz-mirrorhw.bilivideo.com","upos-sz-mirrorbos.bilivideo.com"];
+  const resolver=cdn.createResolver({baseUrl:mediaUrl(hosts[0])},()=>"custom",null,()=>hosts);
+  const urls=Array.from(resolver.urls());
+  resolver.success(urls[1],2e6);resolver.success(urls[2],1e6);
+  resolver.failure(urls[0],dead,1024);
+  assert.equal(resolver.requestUrl(urls[0]),urls[1]);
+  assert.equal(resolver.requestUrl(urls[0],new Set([urls[1]])),urls[2],"a ready second node keeps copies apart");
+  for(const url of urls)resolver.failure(url,dead,1024);
+  assert.equal(resolver.requestUrl(urls[0]),urls[0],"all cooled nodes still allow a bounded retry");
+  let calls=0;
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch:async(_url,init)=>{
+    calls+=1;
+    const [,start,end]=/bytes=(\d+)-(\d+)/.exec(init.headers.Range).map(Number);
+    const bytes=new Uint8Array(end-start+1).fill(calls===1?99:7);
+    return new Response(bytes,{status:calls===1?200:206,headers:{"Content-Range":`bytes ${start}-${end}/8388608`}});
+  }});
+  const result=await downloader.downloadRange({start:0,end:32767,length:32768},resolver);
+  assert.ok(calls>=2,"HTTP 200 is rejected even with matching Range headers");
+  assert.ok(result.bytes.every(value=>value===7),"only verified 206 bytes are delivered");
+});
+
+test("cancelling queued pieces sends no queued requests and releases their slots",{timeout:5000},async()=>{
+  const {cdn,idm}=load();
+  const host="upos-sz-mirrorali.bilivideo.com";
+  const resolver=cdn.createResolver({baseUrl:mediaUrl(host)},()=>"custom",null,()=>[host]);
+  const controller=new AbortController();
+  let calls=0,park=true,reachedFour;
+  const started=new Promise(resolve=>{reachedFour=resolve;});
+  const downloader=idm.createDownloader({getSettings:()=>({concurrency:4}),nativeFetch:async(_url,init)=>{
+    calls+=1;if(calls===4)reachedFour();
+    if(park)return new Promise((_resolve,reject)=>{
+      if(init.signal.aborted)reject(init.signal.reason);
+      else init.signal.addEventListener("abort",()=>reject(init.signal.reason),{once:true});
+    });
+    const [,start,end]=/bytes=(\d+)-(\d+)/.exec(init.headers.Range).map(Number);
+    return new Response(new Uint8Array(end-start+1),{status:206,headers:{"Content-Range":`bytes ${start}-${end}/524288`}});
+  }});
+  const ranges=[{start:0,end:262143,length:262144},{start:262144,end:524287,length:262144}];
+  const pending=Promise.allSettled(ranges.map(range=>downloader.downloadRange(range,resolver,{signal:controller.signal})));
+  await started;controller.abort(new DOMException("cancel queued media","AbortError"));
+  const settled=await pending;
+  assert.equal(calls,4,"the second range stays in the queue until cancelled");
+  assert.ok(settled.every(item=>item.status==="rejected"&&item.reason.name==="AbortError"));
+  assert.equal(resolver.status()[0].state,"untested","cancellation adds no cooldown");
+  park=false;
+  const result=await downloader.downloadRange({start:0,end:32767,length:32768},resolver);
+  assert.equal(result.bytes.length,32768,"the same downloader can acquire slots again");
+});

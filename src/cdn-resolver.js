@@ -359,10 +359,21 @@
     }
 
     const allows = (url) => !bans || bans.allows(url);
+    // A queued request may outlive the health snapshot used to assign its node.
+    // Keep that assignment while it works; only move off a cooled/banned node when
+    // another is ready now. With no ready node the caller can still retry its address.
+    function requestUrl(url, exclude = new Set()) {
+      const now = Date.now();
+      const ready = (candidate) => allows(candidate) && (health.get(candidate)?.blockedUntil || 0) <= now;
+      if (ready(url) && !exclude.has(url)) return url;
+      const available = urls().filter(ready).sort(bySpeed);
+      return available.find((candidate) => !exclude.has(candidate))
+        || (ready(url) ? url : available[0] || url);
+    }
     // The measured download speed of an address, for weighting piece assignments. 0 when
     // there is none or it has gone stale.
     const speed = (url) => (measuredNow(url) ? measurement(url)?.bps || 0 : 0);
-    return Object.freeze({ allows, failure, ordered, rangeCandidates, rescueCandidates, sample, speed, startupCandidates, status, success, urls });
+    return Object.freeze({ allows, failure, ordered, rangeCandidates, requestUrl, rescueCandidates, sample, speed, startupCandidates, status, success, urls });
   }
 
   root.__BILI_CDN_RESOLVER_FACTORY__ = Object.freeze({

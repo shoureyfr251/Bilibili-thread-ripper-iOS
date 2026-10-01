@@ -558,21 +558,25 @@
     // A copy that waited in the queue resumes from what the first copy has received by then,
     // not from what it had when the copy was queued.
     async function attempt(piece, url, signal, kind, resolver, priority = 0, begin = null,
-      deadline = null, observeProgress = null, queueClass = QUEUE_CRITICAL) {
+      deadline = null, observeProgress = null, queueClass = QUEUE_CRITICAL, excludeUrls = null) {
       const settings = config();
       const deadlineAt = deadline ? deadline() : Infinity;
       const release = await semaphore.acquire(signal, priority, deadlineAt, queueClass,
         queueClass === QUEUE_ORDINARY && Number.isFinite(deadlineAt), deadline);
       let received = { bytes: 0, chunks: [] };
-      if (begin) {
-        try {
-          const plan = begin();
+      try {
+        if (signal?.aborted) throw abortError(signal.reason);
+        // Other pieces can cool this node while this request waits for a slot.
+        // Switching here spends no new slot, retry round, or failure strike.
+        if (typeof resolver.requestUrl === "function") url = resolver.requestUrl(url, excludeUrls?.());
+        if (begin) {
+          const plan = begin(url);
           piece = plan.part;
           received = plan.recorder;
-        } catch (error) {
-          release();
-          throw error;
         }
+      } catch (error) {
+        release();
+        throw error;
       }
       const controller = new AbortController();
       const cancel = () => controller.abort(abortError(signal?.reason));
@@ -816,7 +820,7 @@
             // failed attempt, or what the still-running first copy has received by then.
             let base = null;
             const recorder = { bytes: 0, chunks: [] };
-            const begin = () => {
+            const begin = (actualUrl) => {
               if (!pairIndex) firstStartedAt = performance.now();
               base = prefix && prefix.bytes >= RESUME_MIN_BYTES ? prefix : null;
               if (pairIndex) {
@@ -825,7 +829,8 @@
               }
               if (base && base.bytes >= piece.length) base = null;
               const startedAt = performance.now();
-              contexts[pairIndex] = { base, recorder, startedAt, seenBytes: 0, seenAt: startedAt, length: piece.length - (base?.bytes || 0) };
+              contexts[pairIndex] = { base, recorder, startedAt, seenBytes: 0, seenAt: startedAt,
+                url: actualUrl, active: true, length: piece.length - (base?.bytes || 0) };
               return {
                 recorder,
                 part: base
@@ -833,10 +838,13 @@
                   : piece
               };
             };
+            const excludeUrls = () => new Set(contexts
+              .filter((context, index) => index !== pairIndex && context?.active)
+              .map((context) => context.url));
             try {
               const result = await attempt(piece, url, controllers[pairIndex].signal, kind, resolver,
                 priority + (pairIndex ? 20 : 0), begin, deadline, pairIndex ? null : observeFirst,
-                probe ? QUEUE_CRITICAL : startup ? QUEUE_STARTUP : QUEUE_ORDINARY);
+                probe ? QUEUE_CRITICAL : startup ? QUEUE_STARTUP : QUEUE_ORDINARY, excludeUrls);
               return base
                 ? { bytes: core.concatChunks([...base.chunks, result.bytes], piece.length), total: result.total, url: result.url }
                 : result;
@@ -844,6 +852,8 @@
               keepProgress(base, recorder);
               if (!pairIndex) firstFailed();
               throw error;
+            } finally {
+              if (contexts[pairIndex]) contexts[pairIndex].active = false;
             }
           })());
           try {
