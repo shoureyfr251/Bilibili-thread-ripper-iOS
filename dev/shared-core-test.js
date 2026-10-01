@@ -408,3 +408,46 @@ test("a seek during startup schedules a fresh followup and ignores cancelled gen
     await Promise.allSettled(loops);
   }
 });
+
+test("a buffer gap does not admit far-future writes, including held ranges, but nearby media still fills",async()=>{
+  const {context}=load();
+  const source=fs.readFileSync(path.join(SOURCE,"native-mse-player.js"),"utf8");
+  const extract=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
+  const segments=Array.from({length:110},(_item,index)=>({startTime:index*5,endTime:(index+1)*5,length:262144}));
+  let ranges=[[347,360],[360.07,400]],current=352;
+  const sourceBuffer={buffered:{get length(){return ranges.length;},start:index=>ranges[index][0],end:index=>ranges[index][1]}};
+  const track={kind:"video",sourceBuffer,sidx:{segments},nextIndex:80,startupIndex:0,
+    started:true,complete:false,startupComplete:true,prefetches:new Map(),operation:Promise.resolve()};
+  const candidate={generation:1,generationController:new AbortController(),startTime:352,tracks:[track]};
+  const requests=[],writes=[];
+  Object.assign(context,{video:{get currentTime(){return current;}},
+    sessionIsCurrent:value=>value===candidate,aheadTarget:()=>45,updateStartupProfile:()=>6,
+    note(){},options:{onSegment(){}},ensureBuffer(){},maybeEndStream(){},fatal:(_candidate,error)=>{throw error;},
+    segmentDownload(_candidate,_track,_segment,index){requests.push(index);return Promise.resolve({index,
+      result:{bytes:new Uint8Array([index]),byteLength:262144,pieceCount:1,streamed:false}});},
+    append:async(_candidate,_track,bytes)=>{
+      const index=bytes[0];writes.push(index);
+      const entries=[...ranges,[segments[index].startTime,segments[index].endTime]].sort((a,b)=>a[0]-b[0]);
+      ranges=[];for(const entry of entries){const last=ranges.at(-1);if(last&&last[1]>=entry[0])last[1]=Math.max(last[1],entry[1]);else ranges.push(entry.slice());}
+    }});
+  vm.runInContext(extract("  function bufferedEndAt(","  function bufferedStart(")
+    +extract("    function generationSignal(","    function segmentDownload(")
+    +extract("    async function fillTrack(","    function maybeEndStream("),context);
+  assert.equal(context.bufferedEndAt(sourceBuffer,current),360,"playback sees only the continuous range, not data beyond the gap");
+  await context.fillTrack(candidate,track);
+  assert.equal(writes.length,0,"next segment at 400 s is outside the 45 s window from 352 s");
+  assert.equal(requests.length,0,"no additional far-future bytes are requested");
+  track.held={index:80,result:{bytes:new Uint8Array([80]),byteLength:262144,pieceCount:1,streamed:false}};
+  await context.fillTrack(candidate,track);
+  assert.equal(writes.length,0,"a previously held future range also waits for playback to approach");
+  assert.ok(track.held);
+  current=390;await context.fillTrack(candidate,track);
+  assert.equal(writes[0],80,"the held range is appended naturally after playback advances");
+  assert.equal(track.held,null);
+  assert.ok(requests.every(index=>segments[index].startTime-current<45));
+  ranges=[];current=352;track.nextIndex=70;track.complete=false;track.prefetches.clear();
+  requests.length=0;writes.length=0;
+  await context.fillTrack(candidate,track);
+  assert.equal(writes[0],70,"a nearby segment containing the playhead is still downloaded and appended");
+  assert.ok(requests.length>0);
+});

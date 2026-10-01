@@ -657,6 +657,9 @@
             track.complete = true;
             break;
           }
+          // A small timestamp gap can hide a large buffered range further ahead.
+          // Bound the next download/write by its own media time, including held bytes.
+          if (track.sidx.segments[track.nextIndex].startTime - current >= aheadTarget(candidate)) break;
           if (bufferedEndAt(track.sourceBuffer, current) - current >= aheadTarget(candidate)) break;
           // A sliding window: the next segment starts as soon as one has been appended. Waiting
           // for a whole batch left the connections idle until its slowest segment arrived.
@@ -1359,7 +1362,18 @@
         lastSeekMs: Math.round(lastSeekMs),
         stallsAfterSeek,
         timeline: timeline.slice(),
-        tracks: (session?.tracks || []).map((track) => ({ kind: track.kind, nextIndex: track.nextIndex, segments: track.sidx.segments.length }))
+        tracks: (session?.tracks || []).map((track) => {
+          const bufferedRanges = [];
+          try {
+            const ranges = track.sourceBuffer.buffered;
+            for (let index = 0; index < Math.min(8, ranges.length); index++) {
+              bufferedRanges.push([ranges.start(index), ranges.end(index)]);
+            }
+          } catch (_error) {}
+          return { kind: track.kind, nextIndex: track.nextIndex, segments: track.sidx.segments.length,
+            nextSegmentStart: track.sidx.segments[track.nextIndex]?.startTime ?? null,
+            heldIndex: track.held?.index ?? null, bufferedRanges };
+        })
       })
     });
   }
