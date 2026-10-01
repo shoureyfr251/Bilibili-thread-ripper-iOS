@@ -676,6 +676,7 @@
               hurry: segment.startTime - current < 10,
               startup,
               onStartupScheduled: startup ? () => {
+                if (!sessionIsCurrent(candidate) || generation !== candidate.generation || signal.aborted) return;
                 track.startupScheduled = true;
                 maybeStartStartupPrefetch(candidate);
               } : null,
@@ -1008,6 +1009,19 @@
       candidate.ending = false;
       clearTimeout(candidate.endRetryTimer);
       candidate.quotaWaits = 0;
+      // A native history restore can seek while the first video segment is still
+      // downloading. Its old followup and partial profile belong to the cancelled
+      // generation, even if the audio track had already completed its first segment.
+      const restartingStartup = !candidate.playbackActivated;
+      if (restartingStartup) {
+        candidate.startupPrefetchLaunched = false;
+        candidate.startupProfiled = false;
+        candidate.startupCompletedBytes = 0;
+        candidate.startupStartedAt = performance.now();
+        candidate.startupTargetSeconds = STARTUP_RECOVERY_SECONDS;
+        candidate.startupThroughputBps = 0;
+        candidate.mediaBytesPerSecond = 0;
+      }
       for (const track of candidate.tracks) {
         // Queued, so it runs after whatever write is in progress and before the new
         // position's first one: the parser forgets any half-written segment.
@@ -1018,6 +1032,11 @@
         track.held = null;
         track.complete = false;
         track.started = false;
+        if (restartingStartup) {
+          track.startupComplete = false;
+          track.startupScheduled = false;
+          track.followupScheduled = false;
+        }
         track.nextIndex = track.startupIndex = sidxTools.segmentIndexAt(track.sidx.segments, target);
       }
       // Media buffered far from the target only takes room the new position needs.

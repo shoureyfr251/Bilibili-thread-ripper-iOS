@@ -9,7 +9,7 @@ function load(){
   context.__now=1e12;
   vm.runInContext("Date.now=()=>globalThis.__now;",context);
   for(const file of ["range-core.js","cdn-resolver.js","idm-downloader.js"])vm.runInContext(fs.readFileSync(path.join(SOURCE,file),"utf8"),context,{filename:file});
-  return {core:context.__BILI_RANGE_CORE__,cdn:context.__BILI_CDN_RESOLVER_FACTORY__,idm:context.__BILI_IDM_DOWNLOADER_FACTORY__,advance:ms=>{context.__now+=ms;}};
+  return {core:context.__BILI_RANGE_CORE__,cdn:context.__BILI_CDN_RESOLVER_FACTORY__,idm:context.__BILI_IDM_DOWNLOADER_FACTORY__,context,advance:ms=>{context.__now+=ms;}};
 }
 const mediaUrl=host=>`https://${host}/upgcxcode/00/00/1/1-1-30080.m4s?deadline=1&os=x`;
 const dead=Object.assign(new Error("Range 校验失败：HTTP 503"),{name:"Error"});
@@ -335,4 +335,76 @@ test("cancelling queued pieces sends no queued requests and releases their slots
   park=false;
   const result=await downloader.downloadRange({start:0,end:32767,length:32768},resolver);
   assert.equal(result.bytes.length,32768,"the same downloader can acquire slots again");
+});
+
+test("a seek during startup schedules a fresh followup and ignores cancelled generation callbacks",async()=>{
+  const {context}=load();
+  const source=fs.readFileSync(path.join(SOURCE,"native-mse-player.js"),"utf8");
+  // Run the real scheduling functions without starting a browser or recreating its UI.
+  const extract=(start,end)=>{
+    const from=source.indexOf(start),to=source.indexOf(end,from);
+    assert.ok(from>=0&&to>from);return source.slice(from,to);
+  };
+  const candidate={generation:1,generationController:new AbortController(),startTime:0,
+    playbackActivated:false,resumeWanted:false,startupPrefetchLaunched:false,startupProfiled:false,
+    startupCompletedBytes:0,startupStartedAt:0,startupTargetSeconds:6,quotaWaits:0,
+    mediaSource:{duration:60,readyState:"open"},tracks:[]};
+  const segments=Array.from({length:12},(_item,index)=>({startTime:index*5,endTime:(index+1)*5,length:262144}));
+  candidate.tracks=["video","audio"].map(kind=>({kind,sidx:{segments},sourceBuffer:{abort(){}},
+    startupIndex:0,nextIndex:0,started:false,complete:false,startupComplete:false,
+    startupScheduled:false,followupScheduled:false,prefetches:new Map(),operation:Promise.resolve()}));
+  const requests=[],loops=[];
+  Object.assign(context,{STARTUP_RECOVERY_SECONDS:6,video:{currentTime:0,paused:true,pause(){this.paused=true;}},
+    downloaderFactory:{autoConcurrency:{newSession(){}}},sidxTools:{segmentIndexAt:(_segments,time)=>Math.floor(time/5)},
+    sessionIsCurrent:value=>value===candidate,openGeneration:value=>{value.generation+=1;value.generationController=new AbortController();},
+    aheadTarget:()=>45,bufferedEndAt:(_buffer,time)=>time,
+    queuedSourceOperation:(_candidate,_track,operation)=>Promise.resolve(operation()),removeRange:()=>Promise.resolve(),
+    wantsToPlay:()=>candidate.resumeWanted,append:()=>Promise.resolve(),updateStartupProfile:()=>6,
+    note(){},publishState(){},maybeEndStream(){},options:{onSegment(){}},fatal:(_candidate,error)=>{throw error;},
+    segmentDownload(value,track,segment,index,downloadOptions={}){
+      let complete;
+      const promise=new Promise(resolve=>{complete=resolve;});
+      const signal=value.generationController.signal;
+      signal.addEventListener("abort",()=>complete({index,error:signal.reason}),{once:true});
+      requests.push({generation:value.generation,kind:track.kind,index,options:downloadOptions,
+        complete:()=>complete({index,result:{byteLength:segment.length,pieceCount:4,streamed:!!downloadOptions.onOrderedChunk,bytes:new Uint8Array(0)}})});
+      return promise;
+    }});
+  vm.runInContext(extract("    function generationSignal(","    function segmentDownload(")
+    +extract("    function maybeStartStartupPrefetch(","    // How far ahead")
+    +extract("    async function fillTrack(","    function maybeEndStream(")
+    +extract("    async function seekWithinSession(","    async function seek("),context);
+  context.ensureBuffer=value=>{for(const track of value.tracks)loops.push(context.fillTrack(value,track));};
+  const settle=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
+  try{
+    context.ensureBuffer(candidate);
+    const old=requests.filter(request=>request.generation===1&&request.index===0);
+    for(const request of old)request.options.onStartupScheduled();
+    assert.equal(candidate.startupPrefetchLaunched,true,"old generation already prefetched");
+    old.find(request=>request.kind==="audio").complete();await settle();
+    assert.equal(candidate.tracks[1].startupComplete,true);
+    assert.equal(candidate.tracks[0].startupComplete,false,"video head is still in flight");
+    context.video.currentTime=20;
+    await context.seekWithinSession(candidate,20);
+    const fresh=requests.filter(request=>request.generation===2&&request.index===4);
+    assert.equal(fresh.length,2);
+    assert.ok(fresh.every(request=>request.options.startup),"both tracks must restart their startup phase");
+    assert.equal(candidate.startupPrefetchLaunched,false,"new generation cannot inherit old prefetch success");
+    old[0].options.onStartupScheduled();
+    assert.ok(candidate.tracks.every(track=>!track.startupScheduled),"cancelled callbacks cannot mark the new generation");
+    for(const request of fresh)request.options.onStartupScheduled();
+    assert.equal(requests.filter(request=>request.generation===2&&request.index===5).length,2,"new followups start before the large video segment finishes");
+    assert.equal(candidate.resumeWanted,false,"prefetch does not override the viewer's pause intent");
+    assert.equal(context.video.paused,true);
+    assert.equal(candidate.startupCompletedBytes,0);
+    candidate.playbackActivated=true;candidate.resumeWanted=true;candidate.startupPrefetchLaunched=true;
+    for(const track of candidate.tracks)track.startupComplete=true;
+    context.video.currentTime=40;await context.seekWithinSession(candidate,40);
+    assert.equal(candidate.recovering,true,"a normal activated seek retains its recovery path");
+    assert.equal(candidate.recoveryTargetSeconds,6);
+    assert.equal(candidate.startupPrefetchLaunched,true,"activated seeks do not reset initial startup profiling");
+  }finally{
+    candidate.generationController.abort(new DOMException("fixture cleanup","AbortError"));
+    await Promise.allSettled(loops);
+  }
 });
