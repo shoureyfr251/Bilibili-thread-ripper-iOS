@@ -1,6 +1,6 @@
 # Bilibili 线程撕裂者
 
-> **本地稳定增强版**：下载、安装和接手状态见 [HANDOFF](docs/HANDOFF.md)。下方 GitHub 安装链接是上游原版，不是本地增强包。
+> **Local stable enhanced build**: download, install and handoff state are in [HANDOFF](docs/HANDOFF.md). The GitHub install link below is the upstream original, not the local enhanced build.
 
 ## 目录
 
