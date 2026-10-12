@@ -45,6 +45,14 @@
     return Promise.resolve({ status: 403, ok: false, headers: { get: () => null, has: () => false }, body: null });
   }
   let modeLocked = false;
+  // Release profiles. overseas (default, v15/v16 device data): mainland mirrors + akamai, 64 threads.
+  // domestic (users in mainland China, not measured on a device): the player's own mainland hosts
+  // plus the mainland mirrors, 32 threads, no akamai.
+  const PROFILES = {
+    overseas: { concurrency: 64, akamai: true },
+    domestic: { concurrency: 32, akamai: false }
+  };
+  let profile = 'overseas';
   const bans = resolvers.createBanList({ limit: 2 });
   const headersByAddress = new Map();
 
@@ -131,6 +139,17 @@
     }
     if (akamaiByAddress.size > 64) akamaiByAddress.clear();
     if (modeLocked) return;
+    if (profile === 'domestic') {
+      const own = [];
+      for (const url of [raw, ...(alternates || [])]) {
+        let host = '';
+        try { host = new URL(url).hostname.toLowerCase(); } catch (_error) {}
+        if (host && !isAkamai(host) && !own.includes(host)) own.push(host);
+      }
+      const hosts = [...own, ...resolvers.MAINLAND_HOSTS].filter((host, index, all) => all.indexOf(host) === index).slice(0, 16);
+      settings = { ...settings, mode: 'custom', customHosts: hosts };
+      return;
+    }
     // Mainland mirrors plus the akamai host as an extra node; without akamai: plain mainland (v15).
     const known = settings.mode === 'custom' ? (settings.customHosts || []) : [];
     const extra = akamaiHosts.filter(host => !known.includes(host));
@@ -142,6 +161,12 @@
   root.BTREngine = Object.freeze({
     configure(options) {
       const next = { ...settings };
+      if (PROFILES[options?.profile]) {
+        profile = options.profile;
+        next.concurrency = PROFILES[profile].concurrency;
+        useAkamai = PROFILES[profile].akamai;
+        next.mode = 'mainland'; delete next.customHosts; // chooseMode rebuilds the node list per file
+      }
       if (['mainland', 'overseas', 'custom'].includes(options?.mode)) { next.mode = options.mode; modeLocked = true; }
       if (options?.mode === 'all') { next.mode = 'custom'; next.customHosts = [...resolvers.GLOBAL_HOSTS]; modeLocked = true; }
       if (['http', 'https'].includes(options?.scheme)) scheme = options.scheme;
@@ -193,7 +218,7 @@
         entry.mbps = Math.max(entry.mbps, Math.round(node.bps * 8 / 1e4) / 100);
         if (node.state === 'healthy' || entry.state === 'untested') entry.state = node.state;
       }
-      return { ...counters, errorKinds: { ...errorKinds }, mode: settings.mode, scheme, akamai: useAkamai, akamaiAddresses: akamaiByAddress.size, minChunkKiB: Math.round((settings.iosMinChunkBytes || 65536) / 1024), threads: downloader.getConcurrency(),
+      return { ...counters, errorKinds: { ...errorKinds }, profile, mode: settings.mode, scheme, akamai: useAkamai, akamaiAddresses: akamaiByAddress.size, minChunkKiB: Math.round((settings.iosMinChunkBytes || 65536) / 1024), threads: downloader.getConcurrency(),
         auto: factory.autoConcurrency?.status?.() ? { threads: factory.autoConcurrency.status().threads, reason: factory.autoConcurrency.status().reason } : null,
         bannedHosts: bans.hosts(), nodes: Object.values(byHost).slice(0, 24), hostStats: [...hostStats.values()].slice(0, 24), activeJobs: jobs.size, shim: root.__btrShimStats?.() };
     }

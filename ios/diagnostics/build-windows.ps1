@@ -4,7 +4,8 @@ param(
     [string]$SDKPath,
     [string]$OutputDir = (Join-Path $PSScriptRoot '../build'),
     [switch]$Release, # Built-in acceleration, no diagnostic button/menu.
-    [int]$ProbeRevision = 0 # Diagnostic version shown in the menu and reports.
+    [int]$ProbeRevision = 0, # Diagnostic version shown in the menu and reports.
+    [ValidatePattern('^\d+(\.\d+)*$')][string]$Version = '0' # Release version shown in the mode menu.
 )
 $ErrorActionPreference = 'Stop'
 
@@ -49,7 +50,7 @@ foreach ($sourcePath in $sources) {
     $object = Join-Path $OutputDir ([IO.Path]::GetFileNameWithoutExtension($sourcePath) + '.o')
     $objects += $object
     $compileArgs = @('-target', 'arm64-apple-ios15.0', '-isysroot', $SDKPath,
-        '-fobjc-arc', '-fblocks', '-Wall', '-Wextra', '-Wno-unused-parameter', "-DBTR_RELEASE=$([int][bool]$Release)", "-DBTR_PROBE_REVISION=$ProbeRevision",
+        '-fobjc-arc', '-fblocks', '-Wall', '-Wextra', '-Wno-unused-parameter', "-DBTR_RELEASE=$([int][bool]$Release)", "-DBTR_PROBE_REVISION=$ProbeRevision", "-DBTR_VERSION_TEXT=$Version",
         '-c', $sourcePath, '-o', $object)
     & $clang @compileArgs 2>&1 | Tee-Object -FilePath $log -Append
     if ($LASTEXITCODE -ne 0) { throw "Clang failed; see $log" }

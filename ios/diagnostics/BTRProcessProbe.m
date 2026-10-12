@@ -9,6 +9,10 @@
 #ifndef BTR_PROBE_REVISION
 #define BTR_PROBE_REVISION 0
 #endif
+// Release version shown in the release mode menu (-DBTR_VERSION_TEXT=1.0).
+#ifndef BTR_VERSION_TEXT
+#define BTR_VERSION_TEXT 0
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -64,8 +68,10 @@ static BOOL BTRAllowedProcess(void) {
     BOOL marked = [[bundle objectForInfoDictionaryKey:@"BTRProbeEnabled"] boolValue]
         && [[bundle objectForInfoDictionaryKey:@"BTRProbeSourceBundleIdentifier"] isEqual:@"tv.danmaku.bilianime"]
         && [[bundle objectForInfoDictionaryKey:@"BTRProbeSourceVersion"] isEqual:@"8.89.0"];
+    // A dylib injected by Sideloadly keeps no marks and may get a new bundle ID: match the executable.
+    BOOL executable = [[bundle objectForInfoDictionaryKey:@"CFBundleExecutable"] isEqual:@"bili-universal"];
     return [bundle.bundleIdentifier isEqual:@"local.btr.transport-test"]
-       || (version && ([bundle.bundleIdentifier isEqual:BTR_PROBE_TARGET_BUNDLE_ID] || marked));
+       || (version && ([bundle.bundleIdentifier isEqual:BTR_PROBE_TARGET_BUNDLE_ID] || marked || executable));
 }
 
 static void BTRInit(void) {
@@ -1235,6 +1241,126 @@ void BTRProbeShowMenu(void) {
     });
 }
 
+#if BTR_RELEASE
+// Release modes: overseas (default) / domestic / off, remembered across launches. They are switched
+// from a small ball on the screen edge that tucks half away when idle and hides in landscape
+// (full-screen video), so it never covers the picture.
+#define BTR_STR2(x) #x
+#define BTR_STR(x) BTR_STR2(x)
+static NSString *const BTRModeKey = @"BTRAccelMode";
+static NSString *BTRMode(void) {
+    NSString *mode = [NSUserDefaults.standardUserDefaults stringForKey:BTRModeKey];
+    return [@[@"overseas",@"domestic",@"off"] containsObject:mode] ? mode : @"overseas";
+}
+static void BTRApplyMode(NSString *mode) {
+    [NSUserDefaults.standardUserDefaults setObject:mode forKey:BTRModeKey];
+    if([mode isEqual:@"off"]) { if(BTRConcurrentIsEnabled()) BTRSetConcurrentEnabled(NO); return; }
+    if(!BTRConcurrentIsEnabled()) BTRSetConcurrentEnabled(YES);
+    BTREngine *engine; @synchronized(gLock) { engine = gEngine; }
+    [engine configure:@{@"profile":mode}];
+}
+static const CGFloat BTRBallSize = 34;
+static NSString *const BTRBallLeftKey = @"BTRBallLeft", *const BTRBallYKey = @"BTRBallY";
+static CGFloat BTRBallRatio(void) {
+    double ratio = [NSUserDefaults.standardUserDefaults doubleForKey:BTRBallYKey];
+    return ratio > 0 && ratio < 1 ? ratio : 0.62;
+}
+@interface BTRModeBall : UIButton
+@property(nonatomic) BOOL onLeft, tucked;
+@end
+@implementation BTRModeBall {
+    NSUInteger _touch; // Bumped on every interaction; a pending tuck fires only if unchanged.
+}
++ (instancetype)ball {
+    BTRModeBall *ball = [self buttonWithType:UIButtonTypeCustom];
+    ball.frame = CGRectMake(0,0,BTRBallSize,BTRBallSize);
+    ball.layer.cornerRadius = BTRBallSize / 2;
+    ball.layer.shadowOpacity = 0.25; ball.layer.shadowRadius = 3; ball.layer.shadowOffset = CGSizeMake(0,1);
+    ball.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [ball setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    ball.accessibilityLabel = @"B站加速模式";
+    ball.onLeft = [NSUserDefaults.standardUserDefaults boolForKey:BTRBallLeftKey];
+    [ball addTarget:ball action:@selector(tap) forControlEvents:UIControlEventTouchUpInside];
+    [ball addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:ball action:@selector(pan:)]];
+    [ball refresh];
+    return ball;
+}
+- (void)refresh {
+    NSString *mode = BTRMode();
+    [self setTitle:[mode isEqual:@"overseas"] ? @"海" : [mode isEqual:@"domestic"] ? @"国" : @"关" forState:UIControlStateNormal];
+    self.backgroundColor = [mode isEqual:@"off"] ? UIColor.systemGrayColor
+        : [UIColor colorWithRed:0.984 green:0.447 blue:0.600 alpha:1]; // Bilibili pink
+}
+- (void)placeAtY:(CGFloat)y tucked:(BOOL)tucked animated:(BOOL)animated {
+    UIView *host = self.superview;
+    if(!host) return;
+    CGRect area = UIEdgeInsetsInsetRect(host.bounds, host.safeAreaInsets), bounds = host.bounds;
+    CGFloat half = BTRBallSize / 2;
+    y = MIN(MAX(y, area.origin.y + half + 44), (area.origin.y + area.size.height) - half - 64);
+    CGFloat x = self.onLeft ? (tucked ? bounds.origin.x : area.origin.x + half + 6)
+                            : (tucked ? (bounds.origin.x + bounds.size.width) : (area.origin.x + area.size.width) - half - 6);
+    self.tucked = tucked;
+    void (^move)(void) = ^{ self.center = CGPointMake(x,y); self.alpha = tucked ? 0.45 : 0.95; };
+    if(animated) [UIView animateWithDuration:0.25 animations:move]; else move();
+}
+- (void)tuckLater {
+    NSUInteger touch = ++_touch;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if(touch == self->_touch && !self.tucked) [self placeAtY:self.center.y tucked:YES animated:YES];
+    });
+}
+- (void)pan:(UIPanGestureRecognizer *)pan {
+    UIView *host = self.superview;
+    _touch++;
+    if(pan.state == UIGestureRecognizerStateBegan || pan.state == UIGestureRecognizerStateChanged) {
+        self.center = [pan locationInView:host]; self.alpha = 0.95; self.tucked = NO;
+        return;
+    }
+    if(pan.state != UIGestureRecognizerStateEnded && pan.state != UIGestureRecognizerStateCancelled) return;
+    self.onLeft = self.center.x < host.bounds.size.width / 2;
+    [self placeAtY:self.center.y tucked:NO animated:YES];
+    [NSUserDefaults.standardUserDefaults setBool:self.onLeft forKey:BTRBallLeftKey];
+    [NSUserDefaults.standardUserDefaults setDouble:self.center.y / MAX(host.bounds.size.height,1) forKey:BTRBallYKey];
+    [self tuckLater];
+}
+- (void)tap {
+    _touch++;
+    [self placeAtY:self.center.y tucked:NO animated:YES];
+    UIViewController *presenter = BTRPresenter();
+    if(!presenter) { [self tuckLater]; return; }
+    NSString *current = BTRMode();
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"B站加速 v" BTR_STR(BTR_VERSION_TEXT)
+        message:@"在海外选「海外模式」，在国内选「国内模式」。\n切换后，新打开的视频生效。" preferredStyle:UIAlertControllerStyleActionSheet];
+    for(NSArray *option in @[@[@"overseas",@"海外模式"],@[@"domestic",@"国内模式"],@[@"off",@"关闭加速"]]) {
+        NSString *mode = option[0];
+        NSString *title = [mode isEqual:current] ? [option[1] stringByAppendingString:@"  ✓"] : option[1];
+        [menu addAction:[UIAlertAction actionWithTitle:title style:[mode isEqual:@"off"] ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) { BTRApplyMode(mode); [self refresh]; [self tuckLater]; }]];
+    }
+    [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) { [self tuckLater]; }]];
+    menu.popoverPresentationController.sourceView = self;
+    menu.popoverPresentationController.sourceRect = self.bounds;
+    [presenter presentViewController:menu animated:YES completion:nil];
+}
+@end
+static BTRModeBall *gBall;
+// Keeps the ball on top of the key window (full-screen players may bring their own window) and
+// hides it in landscape. On first appearance it shows fully for 3 s, then tucks.
+static void BTRKeepBall(void) {
+    UIWindow *key = nil;
+    for(UIWindow *window in BTRWindows()) if(window.isKeyWindow) key = window;
+    if(!key) return;
+    if(!gBall) gBall = [BTRModeBall ball];
+    gBall.hidden = key.bounds.size.width > key.bounds.size.height;
+    if(gBall.superview != key) {
+        BOOL first = !gBall.superview;
+        [key addSubview:gBall];
+        [gBall placeAtY:key.bounds.size.height * BTRBallRatio() tucked:!first animated:NO];
+        if(first) [gBall tuckLater];
+    } else if(key.subviews.lastObject != gBall) [key bringSubviewToFront:gBall];
+}
+#endif
+
 // Opt-in UI appears in the SAME process after launch. This does not attach to
 // another application or perform loading/injection itself.
 @interface BTRProbeButton : UIButton
@@ -1261,10 +1387,13 @@ __attribute__((constructor)) static void BTRProbeLoaded(void) {
                 BTREntry(@"lifecycle/UIApplicationDidBecomeActiveNotification",UIApplication.sharedApplication);
                 BTRRecord(@"app_lifecycle",nil,@{@"transition":UIApplicationDidBecomeActiveNotification,@"appState":BTRAppState()});
 #if BTR_RELEASE
-                // Release: acceleration is built in and always on (desktop engine, v15 settings);
-                // no floating button, menu or switch.
+                // Release: the remembered mode applies at launch; the edge ball switches it.
                 static dispatch_once_t enableOnce;
-                dispatch_once(&enableOnce, ^{ BTRSetConcurrentEnabled(YES); });
+                dispatch_once(&enableOnce, ^{
+                    BTRApplyMode(BTRMode());
+                    [NSTimer scheduledTimerWithTimeInterval:1 repeats:YES block:^(NSTimer *timer) { BTRKeepBall(); }];
+                });
+                BTRKeepBall();
 #else
                 for(UIWindow *window in BTRWindows()) {
                     if(!window.isKeyWindow || [window viewWithTag:0x425452]) continue;
