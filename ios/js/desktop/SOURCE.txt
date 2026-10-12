@@ -1,0 +1,4 @@
+Unmodified copies from Bilibili-thread-ripper src/ on codex/cdn-stable (stable 2026.10.1.4, code baseline c03cd71).
+range-core.js  sha256 d9f71b47633a008e8e04508d2bacdbb96c7adc78f2c788fc085743f07e1e8aa6
+cdn-resolver.js  sha256 dcd6f28d773eaf796d0aa0ce550f422bf672afae97312c1f87f5632eba95948b
+idm-downloader.js  sha256 0be683ca1da005ff1a8d7f1103501d50dc9c95e5c9fb8504d487440c74f16cfe
